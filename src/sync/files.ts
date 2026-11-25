@@ -19,7 +19,7 @@ interface FileNode {
   url?: string;
   image?: { url: string };
   sources?: { url: string }[];
-  originalSource?: { url: string } | null;
+  originalSource?: { url: string; mimeType?: string | null } | null;
 }
 
 const FILES_QUERY = `#graphql
@@ -30,7 +30,7 @@ const FILES_QUERY = `#graphql
         __typename
         ... on GenericFile { alt url }
         ... on MediaImage { alt image { url } }
-        ... on Video { alt originalSource { url } sources { url } filename }
+        ... on Video { alt originalSource { url mimeType } sources { url } filename }
         ... on Model3d { alt sources { url } }
       }
     }
@@ -66,6 +66,40 @@ const FILE_CREATE = `#graphql
 // re-encoded delivery renditions (.mp4/.m3u8), and fileCreate rejects some of
 // them with "Invalid video url" — the video then never reaches Dev. The
 // original keeps its real extension, so the filename can also be pinned.
+const STAGED_UPLOADS_CREATE = `#graphql
+  mutation StagedUploadsCreate($input: [StagedUploadInput!]!) {
+    stagedUploadsCreate(input: $input) {
+      stagedTargets { url resourceUrl parameters { name value } }
+      userErrors { field message }
+    }
+  }
+`;
+
+// fileCreate rejects a Video's own CDN URL ("Invalid video url"), even the
+// original .webm one, so videos go through a staged upload instead: download
+// the original, push the bytes to Shopify's staging target, then fileCreate
+// from the resulting resourceUrl (the same path the admin UI uses).
+async function stageVideo(ctx: SyncContext, node: FileNode, filename: string): Promise<string> {
+  const download = await fetch(node.originalSource!.url);
+  if (!download.ok) throw new Error(`download failed (${download.status})`);
+  const bytes = await download.arrayBuffer();
+  const mimeType = node.originalSource!.mimeType ?? 'video/mp4';
+
+  const staged: any = await ctx.dev.mutate(STAGED_UPLOADS_CREATE, {
+    input: [{ resource: 'VIDEO', filename, mimeType, httpMethod: 'POST', fileSize: String(bytes.byteLength) }],
+  });
+  const stagedErrors = staged.stagedUploadsCreate.userErrors;
+  if (stagedErrors?.length) throw new Error(`stagedUploadsCreate: ${JSON.stringify(stagedErrors)}`);
+  const target = staged.stagedUploadsCreate.stagedTargets[0];
+
+  const form = new FormData();
+  for (const parameter of target.parameters) form.append(parameter.name, parameter.value);
+  form.append('file', new Blob([bytes], { type: mimeType }), filename);
+  const upload = await fetch(target.url, { method: 'POST', body: form });
+  if (!upload.ok) throw new Error(`staged upload failed (${upload.status}): ${await upload.text()}`);
+  return target.resourceUrl;
+}
+
 function sourceUrl(node: FileNode): string | undefined {
   return node.url ?? node.image?.url ?? node.originalSource?.url ?? node.sources?.[0]?.url;
 }
@@ -157,9 +191,28 @@ export async function syncFiles(ctx: SyncContext): Promise<SyncResult> {
   // blocking too large a batch and to keep error attribution reasonably
   // scoped.
   const BATCH_SIZE = 50;
-  const bar = createProgressBar(uploads.length, 'files');
-  for (let i = 0; i < uploads.length; i += BATCH_SIZE) {
-    const batch = uploads.slice(i, i + BATCH_SIZE);
+  const videoUploads = uploads.filter(({ node }) => node.__typename === 'Video' && node.originalSource);
+  const batchUploads = uploads.filter((upload) => !videoUploads.includes(upload));
+
+  for (const { node, filename } of videoUploads) {
+    const label = node.filename ?? node.originalSource!.url;
+    try {
+      const resourceUrl = await stageVideo(ctx, node, node.filename ?? label.split('/').pop()!);
+      const result: any = await ctx.dev.mutate(FILE_CREATE, {
+        files: [{ alt: node.alt ?? undefined, contentType: 'VIDEO', originalSource: resourceUrl, filename }],
+      });
+      applied += result.fileCreate.files?.length ?? 0;
+      if (result.fileCreate.userErrors?.length) {
+        notes.push(`Video "${label}": ${JSON.stringify(result.fileCreate.userErrors)}`);
+      }
+    } catch (error) {
+      notes.push(`Video "${label}" failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  const bar = createProgressBar(batchUploads.length, 'files');
+  for (let i = 0; i < batchUploads.length; i += BATCH_SIZE) {
+    const batch = batchUploads.slice(i, i + BATCH_SIZE);
     const result: any = await ctx.dev.mutate(FILE_CREATE, {
       files: batch.map(({ node, filename }) => ({
         alt: node.alt ?? undefined,
