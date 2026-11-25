@@ -19,6 +19,7 @@ interface FileNode {
   url?: string;
   image?: { url: string };
   sources?: { url: string }[];
+  originalSource?: { url: string } | null;
 }
 
 const FILES_QUERY = `#graphql
@@ -29,7 +30,7 @@ const FILES_QUERY = `#graphql
         __typename
         ... on GenericFile { alt url }
         ... on MediaImage { alt image { url } }
-        ... on Video { alt sources { url } filename }
+        ... on Video { alt originalSource { url } sources { url } filename }
         ... on Model3d { alt sources { url } }
       }
     }
@@ -61,8 +62,12 @@ const FILE_CREATE = `#graphql
   }
 `;
 
+// For a Video, prefer the original upload over `sources[0]`: `sources` are the
+// re-encoded delivery renditions (.mp4/.m3u8), and fileCreate rejects some of
+// them with "Invalid video url" — the video then never reaches Dev. The
+// original keeps its real extension, so the filename can also be pinned.
 function sourceUrl(node: FileNode): string | undefined {
-  return node.url ?? node.image?.url ?? node.sources?.[0]?.url;
+  return node.url ?? node.image?.url ?? node.originalSource?.url ?? node.sources?.[0]?.url;
 }
 
 function extensionOf(nameOrUrl: string): string | undefined {
